@@ -114,18 +114,16 @@ class SNAPSHOTFILES_preferences(bpy.types.AddonPreferences):
         layout.prop(self, "user_fileversion_prop")
         layout.separator()
 
-        set_output_path = ["set_output_path"]
-        vl_outputs_addons = ["view_layers_toolbox", "viewlayers_toolbox", "view_layers_outputs"]
+        has_output_path = hasattr(bpy.types, "RENDER_OT_setoutputpath")
+        has_vlayer_output = hasattr(bpy.types, "VLOUTPUTS_OT_createnodesoutput")
 
-        new_box = any(t in a for a in bpy.context.preferences.addons.keys() for t in set_output_path + vl_outputs_addons)
-        if new_box:
+        if has_output_path or has_vlayer_output:
             box = layout.box()
             row = box.row()
-            for addon in bpy.context.preferences.addons.keys():
-                if "set_output_path" in addon:
-                    row.prop(self, "user_updateoutputpath")
-                if any(name in addon for name in vl_outputs_addons):
-                    row.prop(self, "user_updateoutputnodes")
+            if has_output_path:
+                row.prop(self, "user_updateoutputpath")
+            if has_vlayer_output:
+                row.prop(self, "user_updateoutputnodes")
             row = box.row()
             row.prop(self, "update_scene_prop")
 
@@ -210,16 +208,21 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
         update_scene_prop = prefs.update_scene_prop
         user_compression_pref = prefs.user_compression_pref
         
-        ## check if another addons are in user addons >> important security because the addon has to be present AND checked
-        for addon in bpy.context.preferences.addons.keys():
-            if "set_output_path" in addon:
-                user_updateoutputpath = prefs.user_updateoutputpath
-            else:
-                user_updateoutputpath = False
-            if "view_layers_toolbox" in addon or "viewlayers_toolbox" in addon:
-                user_updateoutputnodes = prefs.user_updateoutputnodes
-            else:
-                user_updateoutputnodes = False
+        ## check external addons
+        has_output_path = hasattr(bpy.types, "RENDER_OT_setoutputpath")
+        has_vlayer_output = hasattr(bpy.types, "VLOUTPUTS_OT_createnodesoutput")
+
+        if has_output_path:
+            user_updateoutputpath = prefs.user_updateoutputpath
+        else:
+            print('No addon "set output path"')
+            user_updateoutputpath = False
+
+        if has_vlayer_output:
+            user_updateoutputnodes = prefs.user_updateoutputnodes
+        else:
+            print('No addon "view layer outputs"')
+            user_updateoutputnodes = False
 
         if bpy.data.filepath != '':
             snap_Folder = Path(get_snapfolder())
@@ -349,6 +352,7 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
             ## update output path
             if user_updateoutputpath:
                 # print("update output path")
+                print('\nsnap -> Run setoutputpath() (set_output_path addon)')
                 if update_scene_prop == "All Scenes": 
                     for scene in bpy.data.scenes: 
                         bpy.context.window.scene = scene
@@ -359,6 +363,7 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
 
             ## update output view layers
             if user_updateoutputnodes:
+                print('\nsnap -> Run createnodesoutput() (view_layer_toolbox addon)')
                 # print("update node output")
                 if update_scene_prop == "All Scenes":
                     for scene in bpy.data.scenes: 
