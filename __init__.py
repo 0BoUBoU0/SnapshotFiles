@@ -7,7 +7,7 @@ bl_info = {
     "warning": "",
     "category": "General",
     "blender": (4, 0, 0),
-    "version": (1, 4, 0)
+    "version": (1, 4, 1)
 }
 
 # get addon name and version to use them automaticaly in the addon
@@ -17,6 +17,7 @@ ADDON_VERSION = '. '.join([str(n) for n in bl_info["version"]])
 # import modules
 import bpy
 import os
+import re
 from getpass import getuser
 from socket import gethostname
 from shutil import copyfile
@@ -39,9 +40,22 @@ snap_text = 'Snapshots_History'
 
 # define menu
 def snapshotFiles_menu_draw(self,context):
-    version = int(get_version())
-    display_text = f'Snapshot File v{version:03d} to v{version+1:03d}'
-    self.layout.operator("file.snapshotfiles", text=display_text, icon="FILE_TICK")
+    layout = self.layout
+    ## nothing to snapshot yet: don't touch the disk, just tell the user
+    if not bpy.data.filepath:
+        row = layout.row()
+        row.enabled = False
+        row.operator("file.snapshotfiles", text='Snapshot File (save file first)', icon="FILE_TICK")
+        return
+
+    ## raising draw callback could partially or totally break File menu, so never let it
+    try:
+        version = int(get_version())
+        display_text = f'Snapshot File v{version:03d} to v{version+1:03d}'
+    except Exception as e:
+        # print(f'{ADDON_NAME}: could not read snapshot version ({e})')
+        display_text = 'Snapshot File (could not get version)'
+    layout.operator("file.snapshotfiles", text=display_text, icon="FILE_TICK")
 
 
 ## define addon preferences
@@ -57,7 +71,7 @@ class SNAPSHOTFILES_preferences(bpy.types.AddonPreferences):
             ("Save then Copy Main File", "Save then Copy Main File", "Save then Copy Main File the current file", 2),
         )
     )
-    user_snap_folder: StringProperty(name="Snapshot Folder", default=f"//{snap_folder}\\")
+    user_snap_folder: StringProperty(name="Snapshot Folder", default=f"//{snap_folder}/")
     user_snap_extension: StringProperty(
         name="Snapshot extension",
         default=".blendsnap",
@@ -132,17 +146,20 @@ class SNAPSHOTFILES_properties(bpy.types.PropertyGroup):
     file_version: StringProperty(name="", default="v001", description="current file version")
 
 # region Functions
-def get_snapfolder():
+def get_snapfolder(create=False) -> Path | None:
+    """Return the snapshot folder path (None if it cannot be resolved yet).
+    Only creates it on disk when create=True
+    """
     prefs = bpy.context.preferences.addons[__package__].preferences
-    blend_folder = os.path.dirname(bpy.data.filepath)
-    if prefs.user_snap_folder[:2] == "//":
-        cleaned_user_snap_folder = prefs.user_snap_folder.replace("//","").replace("\\","")
-        # create snapshot folder
-        snap_Folder = os.path.join(blend_folder, cleaned_user_snap_folder)
-    else:
-        snap_Folder = prefs.user_snap_folder
-    if not os.path.exists(snap_Folder):
-        os.makedirs(snap_Folder)
+    raw_folder = prefs.user_snap_folder.strip() or f'//{snap_folder}/'
+    ## a blend-relative folder is meaningless without a saved blend
+    if raw_folder.startswith("//") and not bpy.data.filepath:
+        return None
+    ## abspath resolves both the "//" relative form and absolute paths.
+    ## normalize backslashes ? -> # bpy.path.abspath(raw_folder).replace("\\", os.sep)
+    snap_Folder = Path(os.path.normpath(bpy.path.abspath(raw_folder)))
+    if create:
+        snap_Folder.mkdir(parents=True, exist_ok=True)
 
     #print(f'{snap_Folder=}')
     return snap_Folder
@@ -155,17 +172,17 @@ def get_version() -> str:
     # if folder method
     if prefs.get_version_prop == 'Snap Folder (Default)':
         #print("folder method")
-        snap_Folder = get_snapfolder()
-        blend_filename = str(os.path.basename(bpy.data.filepath)).split(".")[0] # get name without extension
+        snap_Folder = get_snapfolder() # path only, folder is created when snapshotting
         ## find all snap existing for the file
         versions_list = []
-        for file in os.listdir(snap_Folder):
-            file_name = str(os.path.basename(file))
-            #print(f"{blend_filename=}")
-            #print(f"{file_name=}")
-            if file_name.startswith(blend_filename) and file_name.endswith(prefs.user_snap_extension):
-                num_version = int(file_name.split('.')[0].split('-')[-1][1:])
-                versions_list.append(num_version)
+        if snap_Folder and snap_Folder.is_dir():
+            blend_filename = Path(bpy.data.filepath).stem # get name without extension
+            for file in snap_Folder.iterdir():
+                if file.name.startswith(blend_filename) and file.suffix == prefs.user_snap_extension:
+                    ## skip unrelated files instead of raising on them
+                    version_match = re.search(r'-v(\d+)$', file.stem)
+                    if version_match:
+                        versions_list.append(int(version_match.group(1)))
         # get last snap version
         if versions_list:
             snap_version = str(max(versions_list)+1).zfill(3)
@@ -174,11 +191,19 @@ def get_version() -> str:
         #print("history method")
         if snap_text in bpy.data.texts.keys():
             snap_history_1st_line = bpy.data.texts[snap_text].lines[0].body
-            last_version = int(snap_history_1st_line.replace("--","").split(":")[-1].replace("v",""))
+            # last_version = int(snap_history_1st_line.replace("--","").split(":")[-1].replace("v",""))
+            if found_version := re.search(r'v(\d+)', snap_history_1st_line):
+                last_version = int(found_version.group(1))
+            else:
+                print('/!\ Version not found in Snapshot History text data, falling back to v001')
+                last_version = 1
             snap_version = str(last_version).zfill(3)
         else:
-            snap_version = str(1).zfill(3)
+            ## explicit fallback (not needed cause already defined at function start) 
+            snap_version = "001"
     elif prefs.get_version_prop == 'Scene Property':
+        # remove trailing 'v'
+        # note: this method is not robust in a multi-scene context
         snap_version = bpy.context.scene.snapshotfiles_props.file_version[1:]
 
     #print(f'{snap_version=}')
@@ -224,187 +249,215 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
             print('No addon "view layer outputs"')
             user_updateoutputnodes = False
 
-        if bpy.data.filepath != '':
-            snap_Folder = Path(get_snapfolder())
+        ## nothing to snapshot yet
+        if not bpy.data.filepath:
+            self.report({'ERROR'}, 'Save the file before making a snapshot')
+            return {'CANCELLED'}
 
-            blend_filename = os.path.basename(bpy.data.filepath)
-            blend_folder = os.path.dirname(bpy.data.filepath)
-            
-            #get current time and date
-            now = datetime.now()
+        snap_Folder = get_snapfolder() # not created yet, see below
 
-            #define snapshot filename
-            # snap_files = os.listdir(path = snap_Folder)
+        blend_filename = os.path.basename(bpy.data.filepath)
+        blend_folder = os.path.dirname(bpy.data.filepath)
 
-            snap_ext = user_snap_extension.replace(".","")
-            filename_clue = blend_filename.replace('.blend', '')
-            filename_snapped = f"{filename_clue}_snap-v"
-            
+        #get current time and date
+        now = datetime.now()
 
-            ## get version from the file
-            snap_version = get_version()
+        #define snapshot filename
 
-            snapfile_name = f"{filename_snapped}{snap_version}.{snap_ext}"
-            print(f"{snapfile_name=}")
-            snap_filepath = snap_Folder.joinpath(snapfile_name)
-            
-            original_file = bpy.data.filepath
-            if user_snap_type_props == "Save then Copy Main File": # save current file
-                bpy.ops.wm.save_mainfile(
-                                        compress=user_compression_pref    
-                                        )
-            
-            copyfile(original_file, snap_filepath) # copy file      
+        snap_ext = user_snap_extension.replace(".","")
+        filename_clue = blend_filename.replace('.blend', '')
+        filename_snapped = f"{filename_clue}_snap-v"
 
-            #add history informations
-            TextsListe = bpy.data.texts.keys()
 
-            # create snap_files history
-            if snap_text not in TextsListe:
-                bpy.ops.text.new()
-                bpy.data.texts["Text"].name = snap_text
+        ## get version from the file
+        snap_version = get_version()
+        new_version = str(int(snap_version) + 1).zfill(3)
 
-            SnapHistoryText = bpy.data.texts[snap_text]
+        snapfile_name = f"{filename_snapped}{snap_version}.{snap_ext}"
+        print(f"{snapfile_name=}")
+        snap_filepath = snap_Folder.joinpath(snapfile_name)
 
-            blender_version = bpy.app.version_string
+        original_file = bpy.data.filepath
+        if user_snap_type_props == "Save then Copy Main File": # save current file
+            bpy.ops.wm.save_mainfile(
+                                    compress=user_compression_pref
+                                    )
 
-            SnapHistoryText.select_set(0, 0, 0, 1000)   
-            if snap_version != '001':
-                SnapHistoryText.write("-- Current File version : v" + str(int(snap_version) + 1).zfill(3) + " --\n \n---------------------------------------------- \n")
-            else:
-                SnapHistoryText.write("-- Current File version : v002 --\n \n---------------------------------------------- \n")
+        ## Create the snapshot folder now if needed
+        folder_existed = snap_Folder.is_dir()
+        try:
+            snap_Folder.mkdir(parents=True, exist_ok=True)
+            copyfile(original_file, snap_filepath) # copy file
+        except OSError as e:
+            ## don't leave an empty folder behind if the snapshot failed
+            if not folder_existed and snap_Folder.is_dir() and not any(snap_Folder.iterdir()):
+                snap_Folder.rmdir()
+            self.report({'ERROR'}, f'Could not write snapshot: {e}')
+            return {'CANCELLED'}
 
-            # history details
-            date_time = now.strftime("%A %d %B %Y" + " at " + "%H:%M:%S")
+        #add history informations
+        TextsListe = bpy.data.texts.keys()
 
-            user_comment = self.text_input
-            if user_commentpref == False:
-                user_comment = "Disabled by user"
-            if user_comment == "":
-                user_comment = "None"
+        # create snap_files history
+        if snap_text not in TextsListe:
+            bpy.ops.text.new()
+            bpy.data.texts["Text"].name = snap_text
 
-            bpy.data.texts[snap_text].cursor_set(3)
-            SnapHistoryText.write(f"Last snapshot made by: {getuser()} \n user comment: {user_comment} \n on: {gethostname()} ({platform}) \n Blender version: Blender {blender_version} \n the: {date_time} \n version based on: {bpy.context.preferences.addons[__name__].preferences.get_version_prop} \n >>> {snap_filepath}")
+        snap_history_text = bpy.data.texts[snap_text]
 
-            ## create a fake file version file
-            if user_fileversion_prop:
-                print("create a fake file version")
+        blender_version = bpy.app.version_string
 
-                snap_history_lines = []
-                for line in bpy.data.texts[snap_text].lines:
-                    snap_history_lines.append(line.body)
+        snap_history_text.select_set(0, 0, 0, 1000)
+        # Determine new first line content
+        if snap_version != '001':
+            new_first_line = "-- Current File version : v" + str(int(snap_version) + 1).zfill(3)
+        else:
+            new_first_line = "-- Current File version : v002"
+        line_sep = " --\n \n---------------------------------------------- \n"
+        snap_history_text.write(new_first_line + line_sep)
 
-                clue = [".","is_v"] # separator, clue
-                def create_versioned_file(original_filename, version, target_directory):
-                    # Ensure the target directory exists
-                    os.makedirs(target_directory, exist_ok=True)
-                    # Create the new filename based on the template
-                    new_filename = f"{original_filename}{clue[0]}{clue[1]}{version}"
-                    # Combine the target directory with the new filename
-                    full_path = os.path.join(target_directory, new_filename)
-                    # Create the new file
-                    with open(full_path, 'w', encoding="utf-8") as file:
-                        #file.write("")
-                        for line in snap_history_lines:
-                            file.write(f'{line}\n')
-                    return full_path
+        # history details
+        date_time = now.strftime("%A %d %B %Y" + " at " + "%H:%M:%S")
 
-                # variables
-                #original_filename = filename_clue
-                original_filename = blend_filename
-                new_version = str(int(snap_version) + 1).zfill(3)
-                target_directory = blend_folder
+        user_comment = self.text_input
+        if user_commentpref == False:
+            user_comment = "Disabled by user"
+        if user_comment == "":
+            user_comment = "None"
 
-                _file_path = create_versioned_file(original_filename, new_version, target_directory)
+        bpy.data.texts[snap_text].cursor_set(3)
+        snap_history_text.write(f"Last snapshot made by: {getuser()} \n user comment: {user_comment} \n on: {gethostname()} ({platform}) \n Blender version: Blender {blender_version} \n the: {date_time} \n version based on: {prefs.get_version_prop} \n >>> {snap_filepath}")
 
-                ## clean previous versions
-                # List to store matching files
-                matching_files = []
-                # Scan the directory for files
-                for filename in os.listdir(target_directory):
-                    # Check if the file contains the original_filename and its extension starts with clue
-                    if original_filename in filename and filename.split(clue[0])[-1].startswith(clue[1]):
-                        if str(filename).split(clue[0])[-1] == f"{clue[1]}{new_version}":
-                            pass 
-                        else:
-                            full_path = os.path.join(target_directory, filename)
-                            os.remove(full_path)
-                        matching_files.append(filename)
-                #print("Matching files:", matching_files)
+        ## create a fake file version file
+        if user_fileversion_prop:
+            print("create a fake file version")
 
-            ## fill scene property
-            for scene in bpy.data.scenes:
-                setattr(scene.snapshotfiles_props, "file_version", f"v{new_version}")
+            snap_history_lines = []
+            for line in bpy.data.texts[snap_text].lines:
+                snap_history_lines.append(line.body)
 
-            del snap_version
+            clue = [".","is_v"] # separator, clue
+            def create_versioned_file(original_filename, version, target_directory):
+                # Ensure the target directory exists
+                os.makedirs(target_directory, exist_ok=True)
+                # Create the new filename based on the template
+                new_filename = f"{original_filename}{clue[0]}{clue[1]}{version}"
+                # Combine the target directory with the new filename
+                full_path = os.path.join(target_directory, new_filename)
+                # Create the new file
+                with open(full_path, 'w', encoding="utf-8") as file:
+                    #file.write("")
+                    for line in snap_history_lines:
+                        file.write(f'{line}\n')
+                return full_path
 
-            ## save file if user wants
-            if user_snap_type_props == "Copy Main File then Save": # save current file
-                bpy.ops.wm.save_mainfile(
-                                        compress=user_compression_pref    
-                                        )
+            # variables
+            #original_filename = filename_clue
+            original_filename = blend_filename
+            target_directory = blend_folder
 
-            ### update output path and node path regarding preferences
-            # print("update outputs ")
-            current_scene = bpy.context.window.scene # store current scene
-            current_layer = bpy.context.window.view_layer # store current view layer
+            _file_path = create_versioned_file(original_filename, new_version, target_directory)
 
-            ## update output path
-            if user_updateoutputpath:
-                # print("update output path")
-                print('\nsnap -> Run setoutputpath() (set_output_path addon)')
-                if update_scene_prop == "All Scenes": 
-                    for scene in bpy.data.scenes: 
-                        bpy.context.window.scene = scene
-                        bpy.ops.render.setoutputpath()
-                    bpy.context.window.scene = current_scene
-                else:
+            ## clean previous versions
+            # List to store matching files
+            matching_files = []
+            # Scan the directory for files
+            for filename in os.listdir(target_directory):
+                # Check if the file contains the original_filename and its extension starts with clue
+                if original_filename in filename and filename.split(clue[0])[-1].startswith(clue[1]):
+                    if str(filename).split(clue[0])[-1] == f"{clue[1]}{new_version}":
+                        pass 
+                    else:
+                        full_path = os.path.join(target_directory, filename)
+                        os.remove(full_path)
+                    matching_files.append(filename)
+            # print(f"matching_files=}")
+
+        ## fill scene property
+        for scene in bpy.data.scenes:
+            setattr(scene.snapshotfiles_props, "file_version", f"v{new_version}")
+
+        ## save file if user wants
+        if user_snap_type_props == "Copy Main File then Save": # save current file
+            bpy.ops.wm.save_mainfile(
+                                    compress=user_compression_pref    
+                                    )
+
+        ### update output path and node path regarding preferences
+        current_scene = bpy.context.window.scene # store current scene
+        current_layer = bpy.context.window.view_layer # store current view layer
+
+        ## update output path
+        if user_updateoutputpath:
+            # print("update output path")
+            print('\nsnap -> Run setoutputpath() (set_output_path addon)')
+            if update_scene_prop == "All Scenes": 
+                for scene in bpy.data.scenes: 
+                    bpy.context.window.scene = scene
                     bpy.ops.render.setoutputpath()
+                bpy.context.window.scene = current_scene
+            else:
+                bpy.ops.render.setoutputpath()
 
-            ## update output view layers
-            if user_updateoutputnodes:
-                print('\nsnap -> Run createnodesoutput() (view_layer_toolbox addon)')
-                # print("update node output")
-                if update_scene_prop == "All Scenes":
-                    for scene in bpy.data.scenes: 
-                        if not bpy.context.scene.render.image_settings.file_format == 'FFMPEG': ## avoid crash because of movie format
-                            bpy.context.window.scene = scene
-                            bpy.ops.vloutputs.createnodesoutput()
-                            bpy.context.window.scene = current_scene
-                            bpy.context.window.view_layer = current_layer
-                else:
-                    bpy.ops.vloutputs.createnodesoutput()
+        ## update output view layers
+        if user_updateoutputnodes:
+            print('\nsnap -> Run createnodesoutput() (view_layer_toolbox addon)')
+            # print("update node output")
+            if update_scene_prop == "All Scenes":
+                for scene in bpy.data.scenes: 
+                    if not bpy.context.scene.render.image_settings.file_format == 'FFMPEG': ## avoid crash because of movie format
+                        bpy.context.window.scene = scene
+                        bpy.ops.vloutputs.createnodesoutput()
+                        bpy.context.window.scene = current_scene
+                        bpy.context.window.view_layer = current_layer
+            else:
+                bpy.ops.vloutputs.createnodesoutput()
 
-            # reset the comment
-            self.text_input = ''#f'v{get_version()} to v{str(int(get_version())+1).zfill(3)}'
+        # reset the comment
+        self.text_input = ''
 
-            print(f"snapshot saved : {str(snap_filepath)}")
-            print(f"\n {separator} {ADDON_NAME} - {ADDON_VERSION} Finished {separator} \n")
-            
-            return {"FINISHED"}
+        print(f"snapshot saved : {str(snap_filepath)}")
+        print(f"\n {separator} {ADDON_NAME} - {ADDON_VERSION} Finished {separator} \n")
+
+        return {"FINISHED"}
+
+    def draw(self, context):
+        ## Added draw focus the field so the user can type right away
+        ## Change in behavior, even to leave no comment, need to press enter twice
+        layout = self.layout
+        layout.activate_init = True
+        layout.label(text='Add a comment:')
+        ## TODO: maybe should explain here what happen ?
+        ## ex: previous save file is copied while this one gets new version + ccmment
+        layout.prop(self, 'text_input', text='')
 
     def invoke(self, context, event):
+        ## nothing to snapshot yet, don't even ask for a comment
+        if not bpy.data.filepath:
+            self.report({'ERROR'}, 'Save the file before making a snapshot')
+            return {'CANCELLED'}
         if bpy.context.preferences.addons[__package__].preferences.user_commentpref:
             return context.window_manager.invoke_props_dialog(self)
         else:
             return self.execute(context)
 
-# list all classes
+
 classes = (
     FILE_OT_snapshotfiles,
     SNAPSHOTFILES_properties,
     SNAPSHOTFILES_preferences,
     )
 
-# create keymap list
+
 addon_keymaps = []
 
-# register classes
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file.append(snapshotFiles_menu_draw)
     bpy.types.Scene.snapshotfiles_props = PointerProperty (type=SNAPSHOTFILES_properties)
+
     # add keymap
     if bpy.context.window_manager.keyconfigs.addon:
         keymap = bpy.context.window_manager.keyconfigs.addon.keymaps.new(name="Window", space_type="EMPTY")
@@ -415,11 +468,12 @@ def register():
                                             )
         addon_keymaps.append((keymap, keymapitem))
 
-# unregister classes
+
 def unregister():    
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     bpy.types.TOPBAR_MT_file.remove(snapshotFiles_menu_draw)
+
     # remove keymap
     for keymap, keymapitem in addon_keymaps:
         keymap.keymap_items.remove(keymapitem)
