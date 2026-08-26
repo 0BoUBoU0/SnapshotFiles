@@ -7,7 +7,7 @@ bl_info = {
     "warning": "",
     "category": "General",
     "blender": (4, 0, 0),
-    "version": (1, 4, 1)
+    "version": (1, 5, 0)
 }
 
 # get addon name and version to use them automaticaly in the addon
@@ -35,7 +35,7 @@ from bpy.props import (
 # define global variables
 separator = "-" * 20
 
-snap_folder = "Snap_Files"
+snap_folder = "_snaps" # previously: Snap_Files
 snap_text = 'Snapshots_History'
 
 # define menu
