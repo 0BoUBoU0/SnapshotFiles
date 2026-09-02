@@ -6,8 +6,8 @@ bl_info = {
     "doc_url": "",
     "warning": "",
     "category": "General",
-    "blender": (4, 0, 0),
-    "version": (1, 5, 0)
+    "blender": (5, 0, 0),
+    "version": (2, 0, 0)
 }
 
 # get addon name and version to use them automaticaly in the addon
@@ -77,7 +77,7 @@ class SNAPSHOTFILES_preferences(bpy.types.AddonPreferences):
         default=".blendsnap",
         description="blendsnap files can be read as blender files, but they won't be scaned in the asset browser",
     )
-    user_commentpref: BoolProperty(
+    user_comment: BoolProperty(
         name="Add a comment", default=True, description="allow the user to add a comment for the current version"
     )
     user_fileversion_prop: BoolProperty(
@@ -85,26 +85,34 @@ class SNAPSHOTFILES_preferences(bpy.types.AddonPreferences):
         default=True,
         description="create a fake version file in the same folder as the original file, to know which version we are",
     )
-    user_compression_pref: BoolProperty(
+    user_compression: BoolProperty(
         name="Compressed files", 
         default=True, 
         description="if checked, snap files and current file will be compressed",
     )
-    user_updateoutputpath: BoolProperty(
+    user_update_output_path: BoolProperty(
         name="Update output path",
         default=True,
         description="if you own the set output path addon, it will automatically update it",
     )
-    user_updateoutputnodes: BoolProperty(
+    user_update_output_nodes: BoolProperty(
         name="Update output nodes",
         default=True,
         description="if you own the view layers addon, it will automatically update it",
     )
-    update_scene_prop: EnumProperty(
+    update_scene_target: EnumProperty(
         name="Update", description="Update scenes", default=1,
         items=(
             ("Opened Scene", "Opened Scene", "Opened Scene", 0),
             ("All Scenes", "All Scenes", "All Scenes", 1),
+        )
+    )
+    update_mode: EnumProperty(
+        name="Update Mode", description="What to update: nothing, only version or trigger path and node tree rebuild", default=1,
+        items=(
+            ("NONE", "Nothing", "File content is untouched", 0),
+            ("VERSION", "Only Update Versions", "Only update versions in output path and file output nodes paths", 1),
+            ("REBUILD", "Path rebuild", "Update main path + node tree using addons set 'output path' + 'viewlayer outputs'", 2),
         )
     )
     get_version_prop: EnumProperty(
@@ -118,28 +126,32 @@ class SNAPSHOTFILES_preferences(bpy.types.AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, "user_commentpref")
+        layout.prop(self, "user_comment")
         row = layout.row()
         row.prop(self, "user_snap_type_props")
-        row.prop(self, "user_compression_pref")
+        row.prop(self, "user_compression")
         layout.prop(self, "user_snap_folder")
         layout.prop(self, "user_snap_extension")
         layout.prop(self, "get_version_prop")
         layout.prop(self, "user_fileversion_prop")
         layout.separator()
 
-        has_output_path = hasattr(bpy.types, "RENDER_OT_setoutputpath")
-        has_vlayer_output = hasattr(bpy.types, "VLOUTPUTS_OT_createnodesoutput")
+        box = layout.box()
+        col = box.column()
+        col.label(text='Path and nodes update:')
+        col.prop(self, "update_mode")
+        col.prop(self, "update_scene_target")
 
-        if has_output_path or has_vlayer_output:
-            box = layout.box()
-            row = box.row()
-            if has_output_path:
-                row.prop(self, "user_updateoutputpath")
-            if has_vlayer_output:
-                row.prop(self, "user_updateoutputnodes")
-            row = box.row()
-            row.prop(self, "update_scene_prop")
+        has_output_path_addon = hasattr(bpy.types, "RENDER_OT_setoutputpath")
+        has_vlayer_output_addon = hasattr(bpy.types, "VLOUTPUTS_OT_createnodesoutput")
+        row = box.row()
+        subrow1 = row.row()
+        subrow1.prop(self, "user_update_output_path")
+        subrow1.enabled = self.update_mode == 'VERSION' or (self.update_mode == 'REBUILD' and has_output_path_addon)
+
+        subrow2 = row.row()
+        subrow2.prop(self, "user_update_output_nodes")
+        subrow2.enabled = self.update_mode == 'VERSION' or (self.update_mode == 'REBUILD' and has_vlayer_output_addon)
 
 
 class SNAPSHOTFILES_properties(bpy.types.PropertyGroup):
@@ -195,12 +207,13 @@ def get_version() -> str:
             if found_version := re.search(r'v(\d+)', snap_history_1st_line):
                 last_version = int(found_version.group(1))
             else:
-                print('/!\ Version not found in Snapshot History text data, falling back to v001')
+                print('/!\\ Version not found in Snapshot History text data, falling back to v001')
                 last_version = 1
             snap_version = str(last_version).zfill(3)
         else:
             ## explicit fallback (not needed cause already defined at function start) 
             snap_version = "001"
+    ## TODO: add method based on local is_version
     elif prefs.get_version_prop == 'Scene Property':
         # remove trailing 'v'
         # note: this method is not robust in a multi-scene context
@@ -209,6 +222,133 @@ def get_version() -> str:
     #print(f'{snap_version=}')
     return snap_version
 
+# region version updater
+
+## version match: lowercase 'v' followed by 3 digit.
+## Anchors: 
+##   - before: only if there is a separator before "-_/\" OR string start (can happen in output nodes).
+##   - after : only with no subsequent digits (ex: v29400)
+DEFAULT_VERSION_PATTERN = r'(?:(?<=[-_./\\ ])|^)v(\d{3})(?![0-9])'
+
+## Simpler anchoring (preventing only match with subsequent digit)
+## DEFAULT_VERSION_PATTERN = r'v(\d{3})(?![0-9])'
+
+def update_version_string(string, version, version_pattern=None):
+    """Update string with passed version on all occurence
+
+    Args:
+        string (str): the string to update
+        version (str|int): version to apply (will get same padding as replaced string)
+        version_pattern (str, optional): regex pattern for version
+    """
+    version_pattern = version_pattern or DEFAULT_VERSION_PATTERN
+    re_version = re.compile(version_pattern)
+    version = int(version)
+
+    def replace(match):
+        new = str(version).zfill(len(match.group(1)))
+        offset = match.start()
+        start, end = match.span(1)
+        whole = match.group(0)
+        return whole[:start - offset] + new + whole[end - offset:]
+
+    return re_version.sub(replace, string)
+
+def update_paths_version_only(new_version, update_output_main=True, update_output_nodes=True, version_pattern=None):
+    """Soft path update, only update version in string, found with 'v' followed by 3 digits"""
+    prefs = bpy.context.preferences.addons[__package__].preferences
+
+    scenes = bpy.data.scenes if prefs.update_scene_target == "All Scenes" else [bpy.context.scene]
+    ## get new version without passing ? (At this point, version has only been updated)
+    # new_version = get_version())
+
+    if update_output_main:
+        for scn in scenes:
+            cur_path = scn.render.filepath
+            new_path = update_version_string(cur_path, new_version, version_pattern)
+            if cur_path != new_path:
+                print(f'update main output:\nold:{cur_path}\nnew:{new_path}')
+                scn.render.filepath = new_path
+
+    if update_output_nodes:
+        for scn in scenes:
+            if not (tree := scn.compositing_node_group):
+                continue
+            nodes = tree.nodes
+            output_file_nodes = [n for n in nodes if n.type == 'OUTPUT_FILE']
+            for out_node in output_file_nodes:
+                ## directory
+                cur_dir_name = out_node.directory
+                new_dir_name = update_version_string(cur_dir_name, new_version, version_pattern)
+                if cur_dir_name != new_dir_name:
+                    print(f'node "{out_node}" directory:\nold:{cur_dir_name}\nnew:{new_dir_name}')
+                    out_node.directory = new_dir_name
+
+                ## filename (second field)
+                cur_file_name = out_node.file_name
+                new_file_name = update_version_string(cur_file_name, new_version, version_pattern)
+                if cur_file_name != new_file_name:
+                    print(f'node "{out_node}" file_name:\nold:{cur_file_name}\nnew:{new_file_name}')
+                    out_node.file_name = new_file_name
+
+                ## slots
+                for i, item in enumerate(out_node.file_output_items):
+                    cur_name = item.name
+                    new_name = update_version_string(cur_name, new_version, version_pattern)
+                    if cur_name != new_name:
+                        print(f'node "{out_node}" item[{i}]:\nold:{cur_name}\nnew:{new_name}')
+                        item.name = new_name
+
+def update_paths_with_addon():
+    """update output path and node path using external addons"""
+    prefs = bpy.context.preferences.addons[__package__].preferences
+
+    ## check external addons
+    has_output_path = hasattr(bpy.types, "RENDER_OT_setoutputpath")
+    has_vlayer_output = hasattr(bpy.types, "VLOUTPUTS_OT_createnodesoutput")
+
+    current_scene = bpy.context.window.scene # store current scene
+    current_layer = bpy.context.window.view_layer # store current view layer
+
+    if has_output_path:
+        update_output_main = prefs.user_update_output_path
+    else:
+        print('No addon "set output path"')
+        update_output_main = False
+
+    if has_vlayer_output:
+        update_output_nodes = prefs.user_update_output_nodes
+    else:
+        print('No addon "view layer outputs"')
+        update_output_nodes = False
+
+    ## update output path
+    if update_output_main:
+        # print("update output path")
+        print('\nsnap -> Run setoutputpath() (set_output_path addon)')
+        if prefs.update_scene_target == "All Scenes": 
+            for scene in bpy.data.scenes: 
+                bpy.context.window.scene = scene
+                bpy.ops.render.setoutputpath()
+            bpy.context.window.scene = current_scene
+        else:
+            bpy.ops.render.setoutputpath()
+
+    ## update output view layers
+    if update_output_nodes:
+        print('\nsnap -> Run createnodesoutput() (view_layer_toolbox addon)')
+        # print("update node output")
+        if prefs.update_scene_target == "All Scenes":
+            for scene in bpy.data.scenes: 
+                if not bpy.context.scene.render.image_settings.file_format == 'FFMPEG': ## avoid crash because of movie format
+                    bpy.context.window.scene = scene
+                    bpy.ops.vloutputs.createnodesoutput()
+
+            # restore org scene/viewlayers
+            bpy.context.window.scene = current_scene
+            bpy.context.window.view_layer = current_layer
+        else:
+            bpy.ops.vloutputs.createnodesoutput()
 
 # region Operator
 class FILE_OT_snapshotfiles(bpy.types.Operator):
@@ -222,34 +362,8 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
     def execute(self, context):
         print(f"\n {separator} Begin {ADDON_NAME} - {ADDON_VERSION} {separator} \n")
         prefs = bpy.context.preferences.addons[__package__].preferences
-        ## get addon preferences
-        user_snap_type_props = prefs.user_snap_type_props
-        # user_snap_folder = prefs.user_snap_folder
-        user_snap_extension = prefs.user_snap_extension
-        
-        
-        user_commentpref = prefs.user_commentpref
-        user_fileversion_prop = prefs.user_fileversion_prop
-        update_scene_prop = prefs.update_scene_prop
-        user_compression_pref = prefs.user_compression_pref
-        
-        ## check external addons
-        has_output_path = hasattr(bpy.types, "RENDER_OT_setoutputpath")
-        has_vlayer_output = hasattr(bpy.types, "VLOUTPUTS_OT_createnodesoutput")
 
-        if has_output_path:
-            user_updateoutputpath = prefs.user_updateoutputpath
-        else:
-            print('No addon "set output path"')
-            user_updateoutputpath = False
-
-        if has_vlayer_output:
-            user_updateoutputnodes = prefs.user_updateoutputnodes
-        else:
-            print('No addon "view layer outputs"')
-            user_updateoutputnodes = False
-
-        ## nothing to snapshot yet
+        ## nothing to snapshot yet, cancel
         if not bpy.data.filepath:
             self.report({'ERROR'}, 'Save the file before making a snapshot')
             return {'CANCELLED'}
@@ -259,15 +373,13 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
         blend_filename = os.path.basename(bpy.data.filepath)
         blend_folder = os.path.dirname(bpy.data.filepath)
 
-        #get current time and date
+        ## get current time and date
         now = datetime.now()
 
-        #define snapshot filename
-
-        snap_ext = user_snap_extension.replace(".","")
+        ## define snapshot filename
+        snap_ext = prefs.user_snap_extension.replace(".","")
         filename_clue = blend_filename.replace('.blend', '')
         filename_snapped = f"{filename_clue}_snap-v"
-
 
         ## get version from the file
         snap_version = get_version()
@@ -278,10 +390,8 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
         snap_filepath = snap_Folder.joinpath(snapfile_name)
 
         original_file = bpy.data.filepath
-        if user_snap_type_props == "Save then Copy Main File": # save current file
-            bpy.ops.wm.save_mainfile(
-                                    compress=user_compression_pref
-                                    )
+        if prefs.user_snap_type_props == "Save then Copy Main File": # save current file
+            bpy.ops.wm.save_mainfile(compress=prefs.user_compression)
 
         ## Create the snapshot folder now if needed
         folder_existed = snap_Folder.is_dir()
@@ -320,7 +430,7 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
         date_time = now.strftime("%A %d %B %Y" + " at " + "%H:%M:%S")
 
         user_comment = self.text_input
-        if user_commentpref == False:
+        if prefs.user_comment == False:
             user_comment = "Disabled by user"
         if user_comment == "":
             user_comment = "None"
@@ -329,7 +439,7 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
         snap_history_text.write(f"Last snapshot made by: {getuser()} \n user comment: {user_comment} \n on: {gethostname()} ({platform}) \n Blender version: Blender {blender_version} \n the: {date_time} \n version based on: {prefs.get_version_prop} \n >>> {snap_filepath}")
 
         ## create a fake file version file
-        if user_fileversion_prop:
+        if prefs.user_fileversion_prop:
             print("create a fake file version")
 
             snap_history_lines = []
@@ -377,41 +487,14 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
         for scene in bpy.data.scenes:
             setattr(scene.snapshotfiles_props, "file_version", f"v{new_version}")
 
+        if prefs.update_mode == 'VERSION':
+            update_paths_version_only(new_version, True, True)
+        elif prefs.update_mode == 'REBUILD':
+            update_paths_with_addon()
+
         ## save file if user wants
-        if user_snap_type_props == "Copy Main File then Save": # save current file
-            bpy.ops.wm.save_mainfile(
-                                    compress=user_compression_pref    
-                                    )
-
-        ### update output path and node path regarding preferences
-        current_scene = bpy.context.window.scene # store current scene
-        current_layer = bpy.context.window.view_layer # store current view layer
-
-        ## update output path
-        if user_updateoutputpath:
-            # print("update output path")
-            print('\nsnap -> Run setoutputpath() (set_output_path addon)')
-            if update_scene_prop == "All Scenes": 
-                for scene in bpy.data.scenes: 
-                    bpy.context.window.scene = scene
-                    bpy.ops.render.setoutputpath()
-                bpy.context.window.scene = current_scene
-            else:
-                bpy.ops.render.setoutputpath()
-
-        ## update output view layers
-        if user_updateoutputnodes:
-            print('\nsnap -> Run createnodesoutput() (view_layer_toolbox addon)')
-            # print("update node output")
-            if update_scene_prop == "All Scenes":
-                for scene in bpy.data.scenes: 
-                    if not bpy.context.scene.render.image_settings.file_format == 'FFMPEG': ## avoid crash because of movie format
-                        bpy.context.window.scene = scene
-                        bpy.ops.vloutputs.createnodesoutput()
-                        bpy.context.window.scene = current_scene
-                        bpy.context.window.view_layer = current_layer
-            else:
-                bpy.ops.vloutputs.createnodesoutput()
+        if prefs.user_snap_type_props == "Copy Main File then Save": # save current file
+            bpy.ops.wm.save_mainfile(compress=prefs.user_compression)
 
         # reset the comment
         self.text_input = ''
@@ -436,7 +519,7 @@ class FILE_OT_snapshotfiles(bpy.types.Operator):
         if not bpy.data.filepath:
             self.report({'ERROR'}, 'Save the file before making a snapshot')
             return {'CANCELLED'}
-        if bpy.context.preferences.addons[__package__].preferences.user_commentpref:
+        if bpy.context.preferences.addons[__package__].preferences.user_comment:
             return context.window_manager.invoke_props_dialog(self)
         else:
             return self.execute(context)
